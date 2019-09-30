@@ -72,6 +72,8 @@ See "Nollup Options" for list of available options.
 * ***String* hmrHost | --hmr-host [host]** - Host to connect to for HMR. Default is ```window.location.host```.
 * ***Function* before** - Receives Express app as argument. Allows for middleware before internally used middleware.
 * ***Function* after** - Receives Express app as argument. Allows for middleware after internally used middleware.
+* ***Boolean* silent | --silent** - Silence dev middleware output and plugin warnings (errors still output).
+* ***Boolean* exitOnError | --exit-on-error** - Exits process if bundling throws error.
 
 ## API
 

@@ -25,6 +25,7 @@ input,
 plugins,
 external,
 acornInjectPlugins
+onwarn
 ```
 
 ### Supported Output Options
@@ -196,6 +197,8 @@ app.use(nollupDevServer(app, config, {
 * ***Boolean* hot -** If true, Hot Module Replacement will be enabled and injected into the bundle.
 * ***Boolean* verbose -** If true, will print status of HMR to developer console.
 * ***String* hmrHost -** Host to connect to for HMR. Default is ```window.location.host```.
+* ***Boolean* silent -** Silence dev middleware output and plugin warnings (errors still output).
+* ***Boolean* exitOnError -** Exits process if bundling throws an error.
 
 ## Hot Module Replacement
 
