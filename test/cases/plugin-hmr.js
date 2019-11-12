@@ -1,16 +1,18 @@
 let plugin = require('../../lib/plugin-hmr');
 let { expect } = require('../nollup');
 
-function createEnv (modules, options = {}) {
-    modules = JSON.parse(JSON.stringify(modules));
+function createEnv (input, options = {}) {
+    input = JSON.parse(JSON.stringify(input));
     options.bundleId = options.bundleId || '';
 
+    let modules = input.map(m => m.code);
     let window = { location: { host: 'example.com' } }, instances = [], stdout = [];
     let console = {
         log: function (...args) {
             stdout.push(args.join(' '));
         } 
     };
+
     let _ws = {
         onmessage: null,
         url: null,
@@ -27,15 +29,20 @@ function createEnv (modules, options = {}) {
     let plugin_instance = plugin(options);
     eval(plugin_instance.nollupBundleInit());
 
-    instances = modules.map(m => {
+    function executeModule (id, deps, code) {
         let module = {
-            dependencies: m.dependencies.slice(0)
+            id: id,
+            dependencies: deps.slice(0)
         };
 
         eval(plugin_instance.nollupModuleInit());
-        eval('(' + m.code + ')()');
+        eval('(' + code + ')()');
 
         return module;
+    }
+
+    instances = input.map((m, i) => {
+        return executeModule(i, m.dependencies, m.code);
     });
 
     return {
@@ -43,8 +50,11 @@ function createEnv (modules, options = {}) {
         ws: _ws,
         console,
         window,
-        modules: modules.map(m => m.code),
-        stdout
+        modules,
+        stdout,
+        executeModule: function (index) {
+            instances[index] = executeModule(index, input[index].dependencies, modules[index])
+        }
     };
 }
 
@@ -146,12 +156,99 @@ describe('plugin-hmr', () => {
             expect(env.instances[2].invalidate).to.be.true;
         });
 
-        it ('should execute accept on root module if root module updates');
-        it ('should handle circular deps when finding accept');
+        it ('should trigger multiple branch accepts on same level', () => {
+            let envTemplate = [{
+                dependencies: [1, 2],
+                code: `
+                    function () { 
+                        module.hot.accept(() => { console.log('mod0 accept') }); 
+                        module.hot.dispose(() => { console.log('mod0 dispose') });
+                    }
+                `
+            }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.accept(() => { console.log('mod1 accept') }); 
+                    module.hot.dispose(() => { console.log('mod1 dispose') })
+                }`
+           }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.accept(() => { console.log('mod2 accept') }); 
+                    module.hot.dispose(() => { console.log('mod2 dispose') })
+                }`
+            }, {
+                dependencies: [],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod3 dispose') })
+                }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 3,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout.length).to.equal(5);
+            expect(env.stdout[0]).to.equal('mod3 dispose');
+            expect(env.stdout[1]).to.equal('mod1 dispose');
+            expect(env.stdout[2]).to.equal('mod2 dispose');
+            expect(env.stdout[3]).to.equal('mod1 accept');
+            expect(env.stdout[4]).to.equal('mod2 accept');
+        })
+
+        it ('should execute accept on root module if root module updates', () => {
+            let env = createEnv([{
+                dependencies: [],
+                code: `
+                    function () { module.hot.accept(() => { console.log('accept') }); }
+                `
+            }]);
+
+            env.ws.send({
+                changes: [{
+                    id: 0,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout[0]).to.equal('accept');
+        });
+
+        it ('should handle circular deps when finding accept', () => {
+            let envTemplate = [{
+                dependencies: [1],
+                code: `
+                    function () { module.hot.accept(() => { console.log('mod0 accept') }); }
+                `
+            }, {
+                dependencies: [2],
+                code: `function () { module.hot.dispose(() => { console.log('mod1 dispose') }) }`
+           }, {
+                dependencies: [1],
+                code: `function () { module.hot.dispose(() => { console.log('mod2 dispose') }) }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 1,
+                    code: 'function () {}'
+                }]
+            });
+
+            expect(env.stdout.length).to.equal(3);
+            expect(env.stdout[0]).to.equal('mod1 dispose');
+            expect(env.stdout[1]).to.equal('mod2 dispose');
+            expect(env.stdout[2]).to.equal('mod0 accept');
+        });
     });
 
     describe('module.hot.dispose()', () => {
-        it ('should only trigger dispose for the module being updated', () => {
+        it ('should only dispose the module being updated if an accept is there', () => {
             let envTemplate = [{
                 dependencies: [1, 2],
                 code: `
@@ -180,8 +277,8 @@ describe('plugin-hmr', () => {
             });
             
             expect(env.stdout.length).to.equal(2);
-            expect(env.stdout[0]).equal('mod1 dispose');
-            expect(env.stdout[1]).equal('mod1 accept');
+            expect(env.stdout[0]).to.equal('mod1 dispose');
+            expect(env.stdout[1]).to.equal('mod1 accept');
 
             env = createEnv(envTemplate);
             env.ws.send({
@@ -191,9 +288,312 @@ describe('plugin-hmr', () => {
                 }]
             })
 
-            expect(env.stdout.length).to.equal(1);
-            expect(env.stdout[0]).equal('mod0 accept');
+            expect(env.stdout.length).to.equal(2);
+            expect(env.stdout[0]).to.equal('mod0 dispose');
+            expect(env.stdout[1]).to.equal('mod0 accept');
         });
+
+        it ('should dispose until it finds an accept handler', () => {
+            let envTemplate = [{
+                dependencies: [1],
+                code: `
+                    function () { 
+                        module.hot.accept(() => { console.log('mod0 accept') }); 
+                        module.hot.dispose(() => { console.log('mod0 dispose') });
+                    }
+                `
+            }, {
+                dependencies: [2],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod1 dispose') })
+                }`
+           }, {
+                dependencies: [],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod2 dispose') })
+                }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 2,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout.length).to.equal(4);
+            expect(env.stdout[0]).to.equal('mod2 dispose');
+            expect(env.stdout[1]).to.equal('mod1 dispose');
+            expect(env.stdout[2]).to.equal('mod0 dispose');
+            expect(env.stdout[3]).to.equal('mod0 accept');
+        });
+
+        it ('should dispose on multiple branches', () => {
+            let envTemplate = [{
+                dependencies: [1, 2],
+                code: `
+                    function () { 
+                        module.hot.accept(() => { console.log('mod0 accept') }); 
+                        module.hot.dispose(() => { console.log('mod0 dispose') });
+                    }
+                `
+            }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod1 dispose') })
+                }`
+           }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod2 dispose') })
+                }`
+            }, {
+                dependencies: [],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod3 dispose') })
+                }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 3,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout.length).to.equal(5);
+            expect(env.stdout[0]).to.equal('mod3 dispose');
+            expect(env.stdout[1]).to.equal('mod1 dispose');
+            expect(env.stdout[2]).to.equal('mod2 dispose');
+            expect(env.stdout[3]).to.equal('mod0 dispose');
+            expect(env.stdout[4]).to.equal('mod0 accept');
+        });
+
+        it ('should not dispose anything unless accept is found', () => {
+            let envTemplate = [{
+                dependencies: [1, 2],
+                code: `
+                    function () { 
+                        module.hot.dispose(() => { console.log('mod0 dispose') });
+                    }
+                `
+            }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod1 dispose') })
+                }`
+           }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod2 dispose') })
+                }`
+            }, {
+                dependencies: [],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod3 dispose') })
+                }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 3,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout.length).to.equal(0);
+        });
+
+        it ('should dispose modules, even if accept handler is on a different branch', () => {
+            // Why allow this? Because "require" could require any module it wants, including other branches.
+            let envTemplate = [{
+                dependencies: [1, 2],
+                code: `
+                    function () { 
+                        module.hot.dispose(() => { console.log('mod0 dispose') });
+                    }
+                `
+            }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.accept(() => { console.log('mod1 accept') }); 
+                    module.hot.dispose(() => { console.log('mod1 dispose') })
+                }`
+           }, {
+                dependencies: [3],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod2 dispose') })
+                }`
+            }, {
+                dependencies: [],
+                code: `function () { 
+                    module.hot.dispose(() => { console.log('mod3 dispose') })
+                }`
+            }]
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 3,
+                    code: 'function () {}'
+                }]
+            });
+            
+            expect(env.stdout.length).to.equal(5);
+            expect(env.stdout[0]).to.equal('mod3 dispose');
+            expect(env.stdout[1]).to.equal('mod1 dispose');
+            expect(env.stdout[2]).to.equal('mod2 dispose');
+            expect(env.stdout[3]).to.equal('mod0 dispose');
+            expect(env.stdout[4]).to.equal('mod1 accept');
+        });
+    });
+
+    describe('module.hot.data', () => {
+        it ('should be undefined on first load', () => {
+            let envTemplate = [{
+                dependencies: [],
+                code: `
+                    function () { 
+                        console.log(typeof module.hot.data);    
+                    }
+                `
+            }];
+
+            let env = createEnv(envTemplate);
+            expect(env.stdout.length).to.equal(1);
+            expect(env.stdout[0]).to.equal('undefined');
+        });
+
+        it ('should be empty object on module reload, even if no dispose handlers', () => {
+            let envTemplate = [{
+                dependencies: [1],
+                code: `
+                    function () { 
+                        module.hot.accept(() => {});
+                        console.log('mod0 ' + typeof module.hot.data);    
+                    }
+                `
+            }, {
+                dependencies: [],
+                code: `
+                    function () { 
+                        console.log('mod1 ' + typeof module.hot.data);    
+                    }
+                `
+            }];
+
+            let env = createEnv(envTemplate);
+
+            env.ws.send({
+                changes: [{
+                    id: 1,
+                    code: `
+                        function () {
+                            console.log('mod1 ' + typeof module.hot.data)
+                        }
+                    `
+                }]
+            });
+
+            env.executeModule(0);
+            env.executeModule(1);
+            expect(env.stdout.length).to.equal(4);
+            expect(env.stdout[0]).to.equal('mod0 undefined');
+            expect(env.stdout[1]).to.equal('mod1 undefined');
+            expect(env.stdout[2]).to.equal('mod0 object');
+            expect(env.stdout[3]).to.equal('mod1 object');
+        });
+
+        it ('should pass empty object to hold data into dispose method', () => {
+            let envTemplate = [{
+                dependencies: [],
+                code: `
+                    function () { 
+                        module.hot.accept(() => {});
+                        module.hot.dispose(data => { console.log(JSON.stringify(data)) });
+                    }
+                `
+            }];
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 0,
+                    code: 'function () {}'
+                }]
+            });
+
+            expect(env.stdout.length).to.equal(1);
+            expect(env.stdout[0]).to.equal('{}');
+        });
+
+        it ('should have module.hot.data containing data from original dispose method', () => {
+            let envTemplate = [{
+                dependencies: [],
+                code: `
+                    function () { 
+                        module.hot.accept(() => {});
+                        module.hot.dispose(data => { 
+                            data.hello = 'world';
+                        });
+                    }
+                `
+            }];
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 0,
+                    code: `function () {
+                        console.log('entry ' + JSON.stringify(module.hot.data));
+                    }`
+                }]
+            });
+
+            env.executeModule(0);
+            expect(env.stdout.length).to.equal(1);
+            expect(env.stdout[0]).to.equal('entry {"hello":"world"}');
+        });
+
+        it ('should pass empty object regardless of modifications to hold data into dispose method', () => {
+            let envTemplate = [{
+                dependencies: [],
+                code: `
+                    function () { 
+                        module.hot.accept(() => {});
+                        module.hot.dispose(data => { 
+                            console.log('dispose ' + JSON.stringify(data));
+                            data.hello = 'world';
+                        });
+                    }
+                `
+            }];
+
+            let env = createEnv(envTemplate);
+            env.ws.send({
+                changes: [{
+                    id: 0,
+                    code: envTemplate[0].code
+                }]
+            });
+
+            env.executeModule(0);
+
+            env.ws.send({
+                changes: [{
+                    id: 0,
+                    code: envTemplate[0].code
+                }]
+            });
+
+            expect(env.stdout.length).to.equal(2);
+            expect(env.stdout[0]).to.equal('dispose {}');
+            expect(env.stdout[1]).to.equal('dispose {}');
+        });
+
     });
 
     describe('module.hot.addStatusHandler()', () => {
